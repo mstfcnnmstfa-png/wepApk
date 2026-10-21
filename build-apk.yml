@@ -1,0 +1,317 @@
+# ---------------------------------------------------------------------------
+# Web2APK Studio — free build worker (GitHub Actions)
+# Save this file in your build repository at exactly this path:
+#     .github/workflows/build-apk.yml
+# No other file is needed in that repository.
+# ---------------------------------------------------------------------------
+name: Build Android App
+
+run-name: "Build ${{ inputs.job_id }} - ${{ inputs.app_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Web2APK Studio build id
+        required: true
+        type: string
+      url:
+        description: Website URL the app opens
+        required: true
+        type: string
+      app_name:
+        description: App name
+        required: true
+        type: string
+      package_name:
+        description: Android package id, e.g. com.example.shop
+        required: true
+        type: string
+      color:
+        description: Theme colour, e.g. #06b6d4
+        required: true
+        type: string
+      icon_b64:
+        description: Icon as base64 PNG/JPG/WebP (optional)
+        required: false
+        type: string
+        default: ""
+      output_format:
+        description: apk | aab | both
+        required: false
+        type: string
+        default: "apk"
+      orientation:
+        description: auto | portrait | landscape
+        required: false
+        type: string
+        default: "auto"
+      status_bar_style:
+        description: dark | light
+        required: false
+        type: string
+        default: "dark"
+      loading_style:
+        description: spinner | bar
+        required: false
+        type: string
+        default: "spinner"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Android build
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      SITE_URL: ${{ inputs.url }}
+      THEME_COLOR: ${{ inputs.color }}
+      ICON_B64: ${{ inputs.icon_b64 }}
+      OUTPUT_FORMAT: ${{ inputs.output_format }}
+      ORIENTATION: ${{ inputs.orientation }}
+      STATUS_BAR_STYLE: ${{ inputs.status_bar_style }}
+      LOADING_STYLE: ${{ inputs.loading_style }}
+      KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+      KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+      KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v6
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android platform
+        run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Create the WebView project
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p wrapper/www
+          cd wrapper
+          cat > package.json <<'JSON'
+          {
+            "name": "web2apk-wrapper",
+            "version": "1.0.0",
+            "private": true
+          }
+          JSON
+          cat > www/index.html <<'HTML'
+          <!doctype html>
+          <html lang="en">
+            <head>
+              <meta charset="utf-8" />
+              <meta name="viewport" content="width=device-width, initial-scale=1" />
+              <title>Loading</title>
+            </head>
+            <body></body>
+          </html>
+          HTML
+          node -e "
+            const fs = require('fs');
+            fs.writeFileSync('capacitor.config.json', JSON.stringify({
+              appId: process.env.PACKAGE_NAME,
+              appName: process.env.APP_NAME,
+              webDir: 'www',
+              server: { url: process.env.SITE_URL, androidScheme: 'https' },
+              plugins: {
+                SplashScreen: {
+                  backgroundColor: process.env.THEME_COLOR,
+                  showSpinner: process.env.LOADING_STYLE !== 'bar',
+                  launchShowDuration: 1200,
+                  launchAutoHide: true
+                }
+              }
+            }, null, 2));
+          "
+          npm install --no-audit --no-fund --silent \
+            @capacitor/core@^6 @capacitor/cli@^6 @capacitor/android@^6 @capacitor/splash-screen@^6
+          npx cap add android
+          npx cap sync android
+
+      - name: Apply app settings
+        shell: bash
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/customize.mjs" <<'NODE'
+          import fs from 'node:fs';
+
+          const root = 'wrapper/android/app/src/main';
+          const name = process.env.APP_NAME || 'App';
+          const pkg = process.env.PACKAGE_NAME || 'com.example.app';
+          const color = process.env.THEME_COLOR || '#06b6d4';
+          const orientation = process.env.ORIENTATION || 'auto';
+          const lightStatusBar = process.env.STATUS_BAR_STYLE === 'light';
+          const escape = (value) =>
+            String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+          const read = (file) => fs.readFileSync(file, 'utf8');
+          const write = (file, text) => fs.writeFileSync(file, text);
+
+          write(`${root}/res/values/strings.xml`, `<?xml version='1.0' encoding='utf-8'?>
+          <resources>
+              <string name="app_name">${escape(name)}</string>
+              <string name="title_activity_main">${escape(name)}</string>
+              <string name="package_name">${escape(pkg)}</string>
+              <string name="custom_url_scheme">${escape(pkg)}</string>
+          </resources>
+          `);
+
+          const colorsFile = `${root}/res/values/colors.xml`;
+          let colors = read(colorsFile);
+          for (const key of ['colorPrimary', 'colorPrimaryDark', 'colorAccent', 'background']) {
+            const pattern = new RegExp(`(<color name="${key}">)[^<]*(</color>)`);
+            if (pattern.test(colors)) colors = colors.replace(pattern, `$1${color}$2`);
+          }
+          if (colors.includes('name="ic_launcher_background"')) {
+            colors = colors.replace(/(<color name="ic_launcher_background">)[^<]*(<\/color>)/, `$1${color}$2`);
+          } else {
+            colors = colors.replace('</resources>', `    <color name="ic_launcher_background">${color}</color>\n</resources>`);
+          }
+          write(colorsFile, colors);
+
+          const stylesFile = `${root}/res/values/styles.xml`;
+          let styles = read(stylesFile);
+          const statusItems = `        <item name="android:statusBarColor">${color}</item>\n        <item name="android:windowLightStatusBar">${lightStatusBar}</item>\n`;
+          styles = styles.replace(/(<style name="AppTheme\.NoActionBar"[^>]*>\n)/, `$1${statusItems}`);
+          styles = styles.replace(/(<style name="AppTheme\.NoActionBarLaunch"[^>]*>)/, `$1\n        <item name="android:background">${color}</item>`);
+          write(stylesFile, styles);
+
+          if (orientation === 'portrait' || orientation === 'landscape') {
+            const manifestFile = `${root}/AndroidManifest.xml`;
+            const manifest = read(manifestFile).replace(
+              /(<activity\b[^>]*android:name="\.MainActivity")/,
+              `$1\n            android:screenOrientation="${orientation}"`,
+            );
+            write(manifestFile, manifest);
+          }
+          NODE
+          node "$RUNNER_TEMP/customize.mjs"
+
+          if [ -n "${ICON_B64:-}" ]; then
+            printf '%s' "$ICON_B64" | base64 -d > "$RUNNER_TEMP/icon.png" 2>/dev/null || true
+            IM="$(command -v magick || command -v convert || true)"
+            if [ -s "$RUNNER_TEMP/icon.png" ] && [ -n "$IM" ]; then
+              for spec in mdpi:48 hdpi:72 xhdpi:96 xxhdpi:144 xxxhdpi:192; do
+                density="${spec%%:*}"
+                size="${spec##*:}"
+                dir="wrapper/android/app/src/main/res/mipmap-${density}"
+                mkdir -p "$dir"
+                "$IM" "$RUNNER_TEMP/icon.png" -resize "${size}x${size}" "$dir/ic_launcher.png"
+                "$IM" "$RUNNER_TEMP/icon.png" -resize "${size}x${size}" "$dir/ic_launcher_round.png"
+                "$IM" "$RUNNER_TEMP/icon.png" -resize "${size}x${size}" "$dir/ic_launcher_foreground.png"
+              done
+            else
+              echo "::warning::The uploaded icon could not be used; the default icon was kept."
+            fi
+          fi
+
+      - name: Build with Gradle
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd wrapper/android
+          SIGNED="no"
+          if [ -n "${KEYSTORE_B64:-}" ] && [ -n "${KEYSTORE_PASSWORD:-}" ] && [ -n "${KEY_ALIAS:-}" ] && [ -n "${KEY_PASSWORD:-}" ]; then
+            printf '%s' "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            {
+              echo "storeFile=$RUNNER_TEMP/release.keystore"
+              echo "storePassword=$KEYSTORE_PASSWORD"
+              echo "keyAlias=$KEY_ALIAS"
+              echo "keyPassword=$KEY_PASSWORD"
+            } > keystore.properties
+            cat >> app/build.gradle <<'GRADLE'
+
+          // Web2APK Studio: release signing. keystore.properties exists only inside CI.
+          def web2apkKeystoreFile = rootProject.file("keystore.properties")
+          if (web2apkKeystoreFile.exists()) {
+              def web2apkKeystore = new Properties()
+              web2apkKeystoreFile.withInputStream { stream -> web2apkKeystore.load(stream) }
+              android {
+                  signingConfigs {
+                      release {
+                          storeFile file(web2apkKeystore['storeFile'])
+                          storePassword web2apkKeystore['storePassword']
+                          keyAlias web2apkKeystore['keyAlias']
+                          keyPassword web2apkKeystore['keyPassword']
+                      }
+                  }
+                  buildTypes {
+                      release {
+                          signingConfig signingConfigs.release
+                      }
+                  }
+              }
+          }
+          GRADLE
+            SIGNED="yes"
+          else
+            if [ "$OUTPUT_FORMAT" != "apk" ]; then
+              echo "::error::AAB builds need the signing secrets (KEYSTORE_BASE64, KEYSTORE_PASSWORD, KEY_ALIAS, KEY_PASSWORD). Add them first, or build an APK only."
+              exit 1
+            fi
+            mkdir -p "$HOME/.android"
+            if [ ! -f "$HOME/.android/debug.keystore" ]; then
+              keytool -genkeypair -keystore "$HOME/.android/debug.keystore" -storepass android -keypass android \
+                -alias androiddebugkey -keyalg RSA -keysize 2048 -validity 10000 -dname "CN=Android Debug,O=Android,C=US"
+            fi
+          fi
+          chmod +x gradlew
+          case "$OUTPUT_FORMAT" in
+            aab) ./gradlew --no-daemon bundleRelease ;;
+            both) ./gradlew --no-daemon assembleRelease bundleRelease ;;
+            *)
+              if [ "$SIGNED" = "yes" ]; then
+                ./gradlew --no-daemon assembleRelease
+              else
+                ./gradlew --no-daemon assembleDebug
+              fi
+              ;;
+          esac
+
+      - name: Verify the output
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          count=0
+          echo "### Web2APK Studio — build output" >> "$GITHUB_STEP_SUMMARY"
+          while IFS= read -r file; do
+            [ -n "$file" ] || continue
+            size=$(stat -c%s "$file")
+            if [ "$size" -lt 10000 ]; then
+              echo "::error::Build output is too small ($size bytes): $file"
+              exit 1
+            fi
+            ext="${file##*.}"
+            cp "$file" "dist/${PACKAGE_NAME}-${ext}"
+            sha=$(sha256sum "$file" | cut -d' ' -f1)
+            echo "- \`${PACKAGE_NAME}-${ext}\` — $((size / 1024)) KB — sha256 \`${sha}\`" >> "$GITHUB_STEP_SUMMARY"
+            count=$((count + 1))
+          done < <(find wrapper/android/app/build/outputs -type f \( -name "*.apk" -o -name "*.aab" \) | sort)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::No APK or AAB file was produced."
+            exit 1
+          fi
+          ls -lh dist
+
+      - name: Upload the app file
+        uses: actions/upload-artifact@v7
+        with:
+          name: app-${{ inputs.output_format }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
