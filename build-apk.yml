@@ -1,0 +1,251 @@
+
+name: Build Android App
+
+run-name: "Build ${{ inputs.job_id }} - ${{ inputs.app_name }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      job_id:
+        description: Build ID
+        required: true
+        type: string
+      url:
+        description: Website URL
+        required: true
+        type: string
+      app_name:
+        description: Android app name
+        required: true
+        type: string
+      package_name:
+        description: Android package ID
+        required: true
+        type: string
+      color:
+        description: Theme color
+        required: true
+        type: string
+        default: "#06b6d4"
+      orientation:
+        description: Screen orientation
+        required: true
+        type: choice
+        options:
+          - auto
+          - portrait
+          - landscape
+        default: auto
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build Android APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    env:
+      APP_NAME: ${{ inputs.app_name }}
+      PACKAGE_NAME: ${{ inputs.package_name }}
+      SITE_URL: ${{ inputs.url }}
+      THEME_COLOR: ${{ inputs.color }}
+      ORIENTATION: ${{ inputs.orientation }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v4
+
+      - name: Install Android SDK packages
+        run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;34.0.0"
+
+      - name: Validate inputs
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          node -e '
+            const u = new URL(process.env.SITE_URL);
+            if (u.protocol !== "https:") {
+              throw new Error("Website URL must use HTTPS");
+            }
+          '
+
+          if ! [[ "$PACKAGE_NAME" =~ ^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$ ]]; then
+            echo "::error::Invalid Android package ID"
+            exit 1
+          fi
+
+          if ! [[ "$THEME_COLOR" =~ ^#[0-9a-fA-F]{6}$ ]]; then
+            echo "::error::Color must look like #06b6d4"
+            exit 1
+          fi
+
+      - name: Create Capacitor project
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p wrapper/www
+          cd wrapper
+
+          cat > package.json <<'JSON'
+          {
+            "name": "web2apk-wrapper",
+            "version": "1.0.0",
+            "private": true
+          }
+          JSON
+
+          cat > www/index.html <<'HTML'
+          <!doctype html>
+          <html>
+          <head>
+            <meta charset="utf-8">
+            <meta name="viewport" content="width=device-width, initial-scale=1">
+            <title>Loading</title>
+          </head>
+          <body></body>
+          </html>
+          HTML
+
+          node -e '
+            const fs = require("fs");
+            fs.writeFileSync("capacitor.config.json", JSON.stringify({
+              appId: process.env.PACKAGE_NAME,
+              appName: process.env.APP_NAME,
+              webDir: "www",
+              server: {
+                url: process.env.SITE_URL,
+                androidScheme: "https"
+              },
+              plugins: {
+                SplashScreen: {
+                  backgroundColor: process.env.THEME_COLOR,
+                  launchShowDuration: 1200,
+                  launchAutoHide: true
+                }
+              }
+            }, null, 2));
+          '
+
+          npm install --no-audit --no-fund --silent \
+            @capacitor/core@^6 \
+            @capacitor/cli@^6 \
+            @capacitor/android@^6 \
+            @capacitor/splash-screen@^6
+
+          npx cap add android
+          npx cap sync android
+
+      - name: Apply Android settings
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd wrapper/android
+
+          export APP_NAME PACKAGE_NAME THEME_COLOR ORIENTATION
+
+          node --input-type=module <<'NODE'
+          import fs from "node:fs";
+
+          const root = "app/src/main";
+          const escape = s => String(s)
+            .replace(/&/g, "&amp;")
+            .replace(/</g, "&lt;")
+            .replace(/>/g, "&gt;");
+
+          fs.writeFileSync(
+            `${root}/res/values/strings.xml`,
+            `<?xml version="1.0" encoding="utf-8"?>
+          <resources>
+            <string name="app_name">${escape(process.env.APP_NAME)}</string>
+            <string name="title_activity_main">${escape(process.env.APP_NAME)}</string>
+            <string name="package_name">${escape(process.env.PACKAGE_NAME)}</string>
+            <string name="custom_url_scheme">${escape(process.env.PACKAGE_NAME)}</string>
+          </resources>`
+          );
+
+          const colorFile = `${root}/res/values/colors.xml`;
+          let colors = fs.readFileSync(colorFile, "utf8");
+          const color = process.env.THEME_COLOR;
+
+          for (const key of [
+            "colorPrimary",
+            "colorPrimaryDark",
+            "colorAccent"
+          ]) {
+            const re = new RegExp(
+              `(<color name="${key}">)[^<]*(</color>)`
+            );
+            colors = colors.replace(re, `$1${color}$2`);
+          }
+
+          fs.writeFileSync(colorFile, colors);
+
+          if (["portrait", "landscape"].includes(process.env.ORIENTATION)) {
+            const manifestFile = `${root}/AndroidManifest.xml`;
+            let manifest = fs.readFileSync(manifestFile, "utf8");
+
+            manifest = manifest.replace(
+              /(<activity\b[^>]*android:name="\.MainActivity")/,
+              `$1 android:screenOrientation="${process.env.ORIENTATION}"`
+            );
+
+            fs.writeFileSync(manifestFile, manifest);
+          }
+          NODE
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          cd wrapper/android
+          chmod +x gradlew
+          ./gradlew --no-daemon assembleDebug
+
+      - name: Verify APK
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mkdir -p dist
+
+          APK="wrapper/android/app/build/outputs/apk/debug/app-debug.apk"
+
+          if [ ! -s "$APK" ]; then
+            echo "::error::APK was not created"
+            exit 1
+          fi
+
+          SIZE=$(stat -c%s "$APK")
+
+          if [ "$SIZE" -lt 10000 ]; then
+            echo "::error::APK file is unexpectedly small"
+            exit 1
+          fi
+
+          cp "$APK" "dist/${PACKAGE_NAME}.apk"
+
+          echo "APK successfully created." >> "$GITHUB_STEP_SUMMARY"
+          ls -lh dist
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: android-apk
+          path: dist/*.apk
+          if-no-files-found: error
+          retention-days: 7
